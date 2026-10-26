@@ -1,0 +1,507 @@
+import base64
+import json
+import logging
+import os
+import subprocess
+import tempfile
+from io import BytesIO
+from pathlib import Path
+
+from dotenv import load_dotenv
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from imageio_ffmpeg import get_ffmpeg_exe
+from openai import APIConnectionError, APIError, OpenAI, RateLimitError
+from PIL import Image as PILImage, UnidentifiedImageError
+from pydantic import BaseModel, Field, ValidationError
+import pytesseract
+from pytesseract import TesseractNotFoundError
+
+
+load_dotenv(Path(__file__).with_name(".env"))
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("brand_lens")
+
+app = FastAPI(title="Brand Lens API")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ],
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
+)
+
+MAX_IMAGE_BYTES = 20 * 1024 * 1024
+MAX_VIDEO_BYTES = 100 * 1024 * 1024
+MAX_VIDEO_ANALYSIS_SECONDS = 120
+MAX_TRANSCRIPTION_BYTES = 25 * 1024 * 1024
+MAX_IMAGE_PIXELS = 40_000_000
+VIDEO_EXTENSIONS = {".mp4", ".mov", ".webm"}
+IMAGE_FORMATS = {
+    ".jpg": "JPEG",
+    ".jpeg": "JPEG",
+    ".png": "PNG",
+    ".webp": "WEBP",
+}
+
+
+class BrandRule(BaseModel):
+    category: str
+    title: str
+    description: str
+
+
+DEFAULT_RULES = [
+    BrandRule(
+        category="Claims & promises",
+        title="No unsupported guarantees",
+        description="Do not promise guaranteed outcomes or 100% success without approved evidence.",
+    ),
+    BrandRule(
+        category="Tone of voice",
+        title="Confident, clear and helpful",
+        description="Avoid aggressive, insulting or exaggerated wording.",
+    ),
+    BrandRule(
+        category="Visual identity",
+        title="Use approved brand assets",
+        description="Use current logo, colours and approved product imagery.",
+    ),
+    BrandRule(
+        category="Legal & compliance",
+        title="Mandatory disclaimer",
+        description="Include the approved disclaimer wherever required.",
+    ),
+]
+
+
+class AnalysisRequest(BaseModel):
+    content: str = Field(min_length=1, max_length=40000)
+    employee_name: str = "Employee"
+    filename: str = "Written content"
+    rules: list[BrandRule] | None = None
+
+
+class Violation(BaseModel):
+    severity: str
+    title: str
+    evidence: str
+    recommendations: list[str]
+
+
+class AnalysisResult(BaseModel):
+    compliance_score: int | None
+    publishing_status: str
+    violations: list[Violation]
+    recommendations: list[str]
+
+
+RESULT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "compliance_score": {"type": ["integer", "null"]},
+        "publishing_status": {
+            "type": "string",
+            "enum": [
+                "Ready to publish",
+                "Changes required",
+                "Escalation recommended",
+                "Needs human review",
+            ],
+        },
+        "violations": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "severity": {
+                        "type": "string",
+                        "enum": ["High", "Medium", "Low"],
+                    },
+                    "title": {"type": "string"},
+                    "evidence": {"type": "string"},
+                    "recommendations": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                },
+                "required": [
+                    "severity",
+                    "title",
+                    "evidence",
+                    "recommendations",
+                ],
+                "additionalProperties": False,
+            },
+        },
+        "recommendations": {
+            "type": "array",
+            "items": {"type": "string"},
+        },
+    },
+    "required": [
+        "compliance_score",
+        "publishing_status",
+        "violations",
+        "recommendations",
+    ],
+    "additionalProperties": False,
+}
+
+
+def require_openai_client() -> OpenAI:
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise HTTPException(
+            status_code=503,
+            detail="OpenAI is not configured. Add OPENAI_API_KEY to backend/.env and restart the backend.",
+        )
+    return OpenAI(api_key=api_key)
+
+
+def selected_rules(rules: list[BrandRule] | None) -> list[BrandRule]:
+    return rules if rules else DEFAULT_RULES
+
+
+def normalize_rules(rules_json: str) -> list[BrandRule] | None:
+    if not rules_json:
+        return None
+    if len(rules_json) > 20000:
+        raise HTTPException(status_code=400, detail="The supplied brand rules are too large.")
+    try:
+        decoded = json.loads(rules_json)
+        if not isinstance(decoded, list):
+            raise ValueError("Brand rules must be a JSON list.")
+        return [BrandRule.model_validate(rule) for rule in decoded]
+    except (json.JSONDecodeError, ValidationError, ValueError) as error:
+        raise HTTPException(status_code=400, detail="Brand rules are invalid JSON.") from error
+
+
+def openai_http_error(error: Exception) -> HTTPException:
+    if isinstance(error, RateLimitError):
+        logger.warning("OpenAI rate limit reached: %s", error)
+        return HTTPException(
+            status_code=429,
+            detail="OpenAI rate limit reached. Please wait briefly and try again.",
+            headers={"Retry-After": "10"},
+        )
+    if isinstance(error, APIConnectionError):
+        logger.exception("Could not connect to OpenAI")
+        return HTTPException(
+            status_code=502,
+            detail="Could not connect to OpenAI. Check the backend network connection and try again.",
+        )
+    if isinstance(error, APIError):
+        logger.exception("OpenAI API request failed")
+        return HTTPException(
+            status_code=502,
+            detail="OpenAI could not complete the analysis. Please try again.",
+        )
+    raise error
+
+
+def analyze_submission(
+    client: OpenAI,
+    text: str,
+    rules: list[BrandRule],
+    images: list[bytes] | None = None,
+) -> AnalysisResult:
+    rule_text = "\n".join(
+        f"- [{rule.category}] {rule.title}: {rule.description}" for rule in rules
+    )
+    prompt = (
+        "Assess this submission only against the supplied company brand rules. "
+        "Cite observable text or visual/audio evidence for every violation. "
+        "Do not infer facts that the submission does not support. "
+        "If evidence is insufficient to make a reliable assessment, set "
+        "compliance_score to null and publishing_status to 'Needs human review'. "
+        "Otherwise provide a 0-100 compliance score justified by the analysis. "
+        "Use 'Ready to publish' only when no violations are found; use "
+        "'Escalation recommended' for a high-severity violation; otherwise use "
+        "'Changes required' when violations are present. Do not invent evidence.\n\n"
+        f"Company brand rules:\n{rule_text}\n\n"
+        f"Submission text, OCR text, caption, or transcript:\n{text or '[No text supplied; assess the attached visual evidence.]'}"
+    )
+    content = [{"type": "input_text", "text": prompt}]
+    for image in images or []:
+        encoded = base64.b64encode(image).decode("ascii")
+        content.append(
+            {
+                "type": "input_image",
+                "image_url": f"data:image/jpeg;base64,{encoded}",
+                "detail": "high",
+            }
+        )
+
+    try:
+        response = client.responses.create(
+            model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+            input=[{"role": "user", "content": content}],
+            text={
+                "format": {
+                    "type": "json_schema",
+                    "name": "brand_lens_compliance_analysis",
+                    "strict": True,
+                    "schema": RESULT_SCHEMA,
+                }
+            },
+        )
+    except (RateLimitError, APIConnectionError, APIError) as error:
+        raise openai_http_error(error) from error
+
+    try:
+        return AnalysisResult.model_validate_json(response.output_text)
+    except (ValidationError, ValueError) as error:
+        logger.exception("OpenAI returned an invalid structured analysis")
+        raise HTTPException(
+            status_code=502,
+            detail="OpenAI returned an invalid analysis response. Please try again.",
+        ) from error
+
+
+def response_payload(
+    result: AnalysisResult,
+    filename: str,
+    employee_name: str,
+) -> dict:
+    violations = [violation.model_dump() for violation in result.violations]
+    issues = [
+        [
+            violation.severity,
+            violation.title,
+            violation.evidence,
+            " ".join(violation.recommendations),
+        ]
+        for violation in result.violations
+    ]
+    return {
+        "success": True,
+        "compliance_score": result.compliance_score,
+        "publishing_status": result.publishing_status,
+        "violations": violations,
+        "severity": [violation["severity"] for violation in violations],
+        "evidence": [violation["evidence"] for violation in violations],
+        "recommendations": result.recommendations,
+        "score": result.compliance_score,
+        "out": result.publishing_status,
+        "issues": issues,
+        "file": filename,
+        "employee": employee_name,
+    }
+
+
+def read_upload(file: UploadFile, max_bytes: int) -> tuple[bytes, str]:
+    suffix = Path(file.filename or "").suffix.lower()
+    data = file.file.read(max_bytes + 1)
+    if len(data) > max_bytes:
+        raise HTTPException(status_code=413, detail="The uploaded file exceeds the size limit.")
+    return data, suffix
+
+
+def extract_video_frames(video_path: str) -> list[bytes]:
+    try:
+        result = subprocess.run(
+            [
+                get_ffmpeg_exe(),
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                video_path,
+                "-t",
+                str(MAX_VIDEO_ANALYSIS_SECONDS),
+                "-vf",
+                "fps=1/10,scale=768:-2",
+                "-frames:v",
+                "12",
+                "-f",
+                "image2pipe",
+                "-vcodec",
+                "mjpeg",
+                "pipe:1",
+            ],
+            capture_output=True,
+            timeout=60,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise HTTPException(
+            status_code=422,
+            detail="Video frame extraction timed out. Try a shorter video.",
+        ) from error
+    except (OSError, RuntimeError) as error:
+        logger.exception("Could not start FFmpeg")
+        raise HTTPException(
+            status_code=503,
+            detail="Video processing is unavailable. Reinstall the backend dependencies.",
+        ) from error
+
+    frames = []
+    for section in result.stdout.split(b"\xff\xd8")[1:]:
+        frame = b"\xff\xd8" + section.split(b"\xff\xd9", 1)[0] + b"\xff\xd9"
+        if frame.endswith(b"\xff\xd9"):
+            frames.append(frame)
+    if result.returncode != 0 or not frames:
+        raise HTTPException(
+            status_code=400,
+            detail="The uploaded video is invalid, corrupted, or contains no readable frames.",
+        )
+    return frames
+
+
+def extract_video_audio(video_path: str) -> bytes | None:
+    try:
+        result = subprocess.run(
+            [
+                get_ffmpeg_exe(),
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                video_path,
+                "-t",
+                str(MAX_VIDEO_ANALYSIS_SECONDS),
+                "-map",
+                "0:a:0",
+                "-vn",
+                "-ac",
+                "1",
+                "-ar",
+                "16000",
+                "-f",
+                "mp3",
+                "pipe:1",
+            ],
+            capture_output=True,
+            timeout=60,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        logger.warning("Audio extraction timed out; continuing with video frames only")
+        return None
+    except (OSError, RuntimeError):
+        logger.warning("Audio extraction is unavailable; continuing with video frames only")
+        return None
+    if result.returncode != 0 or not result.stdout:
+        return None
+    if len(result.stdout) > MAX_TRANSCRIPTION_BYTES:
+        logger.warning("Extracted audio is too large to transcribe; continuing with frames only")
+        return None
+    return result.stdout
+
+
+def transcribe_audio(client: OpenAI, audio: bytes) -> str:
+    try:
+        transcription = client.audio.transcriptions.create(
+            model=os.getenv("OPENAI_TRANSCRIPTION_MODEL", "whisper-1"),
+            file=("video-audio.mp3", BytesIO(audio), "audio/mpeg"),
+        )
+        return transcription.text
+    except (RateLimitError, APIConnectionError, APIError) as error:
+        raise openai_http_error(error) from error
+
+
+@app.get("/")
+def home():
+    return {"message": "Brand Lens API is running", "status": "online"}
+
+
+@app.post("/api/analyze")
+def analyze_content(data: AnalysisRequest):
+    client = require_openai_client()
+    result = analyze_submission(
+        client,
+        data.content,
+        selected_rules(data.rules),
+    )
+    return response_payload(result, data.filename, data.employee_name)
+
+
+@app.post("/api/analyze/image")
+def analyze_image(
+    file: UploadFile = File(...),
+    employee_name: str = Form("Employee"),
+    context: str = Form("", max_length=10000),
+    rules_json: str = Form(""),
+):
+    client = require_openai_client()
+    data, suffix = read_upload(file, MAX_IMAGE_BYTES)
+    expected_format = IMAGE_FORMATS.get(suffix)
+    if expected_format is None:
+        raise HTTPException(status_code=415, detail="Use a JPG, JPEG, PNG, or WEBP image.")
+
+    try:
+        with PILImage.open(BytesIO(data)) as image:
+            if image.format != expected_format:
+                raise HTTPException(status_code=415, detail="The file extension does not match its image format.")
+            if image.width * image.height > MAX_IMAGE_PIXELS:
+                raise HTTPException(status_code=413, detail="The image dimensions exceed the supported limit.")
+            image.verify()
+        with PILImage.open(BytesIO(data)) as image:
+            try:
+                ocr_text = pytesseract.image_to_string(image, timeout=20).strip()
+            except (TesseractNotFoundError, RuntimeError) as error:
+                logger.warning("Tesseract OCR is unavailable; using OpenAI vision: %s", error)
+                ocr_text = ""
+    except UnidentifiedImageError as error:
+        raise HTTPException(status_code=400, detail="The uploaded image could not be decoded.") from error
+    except OSError as error:
+        raise HTTPException(status_code=400, detail="The uploaded image is invalid or corrupted.") from error
+
+    analysis_text = (
+        f"Employee-provided context:\n{context}\n\nOCR-extracted text:\n{ocr_text}"
+        if ocr_text
+        else f"Employee-provided context:\n{context}\n\nOCR did not extract text; inspect the image directly."
+    )
+    result = analyze_submission(
+        client,
+        analysis_text,
+        selected_rules(normalize_rules(rules_json)),
+        images=[data],
+    )
+    return response_payload(result, file.filename or "Uploaded image", employee_name)
+
+
+@app.post("/api/analyze/video")
+def analyze_video(
+    file: UploadFile = File(...),
+    employee_name: str = Form("Employee"),
+    context: str = Form("", max_length=10000),
+    rules_json: str = Form(""),
+):
+    client = require_openai_client()
+    data, suffix = read_upload(file, MAX_VIDEO_BYTES)
+    if suffix not in VIDEO_EXTENSIONS:
+        raise HTTPException(status_code=415, detail="Use an MP4, MOV, or WEBM video.")
+
+    temp_path = ""
+    try:
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as temp_file:
+            temp_file.write(data)
+            temp_path = temp_file.name
+        frames = extract_video_frames(temp_path)
+        audio = extract_video_audio(temp_path)
+    finally:
+        if temp_path:
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                logger.warning("Could not remove temporary video file: %s", temp_path)
+
+    transcript = transcribe_audio(client, audio) if audio else ""
+    analysis_text = (
+        "Analyze sampled frames from the first two minutes of the video. "
+        "The audio transcript may be partial.\n\n"
+        f"Employee-provided context:\n{context}\n\n"
+        f"Audio transcript:\n{transcript or '[No audio track or transcription available.]'}"
+    )
+    result = analyze_submission(
+        client,
+        analysis_text,
+        selected_rules(normalize_rules(rules_json)),
+        images=frames,
+    )
+    return response_payload(result, file.filename or "Uploaded video", employee_name)
