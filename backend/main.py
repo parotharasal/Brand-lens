@@ -6,6 +6,7 @@ import subprocess
 import tempfile
 from io import BytesIO
 from pathlib import Path
+from uuid import UUID
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
@@ -16,6 +17,7 @@ from PIL import Image as PILImage, UnidentifiedImageError
 from pydantic import BaseModel, Field, ValidationError
 import pytesseract
 from pytesseract import TesseractNotFoundError
+from supabase import Client, create_client
 
 
 load_dotenv(Path(__file__).with_name(".env"))
@@ -85,6 +87,18 @@ class AnalysisRequest(BaseModel):
     rules: list[BrandRule] | None = None
 
 
+class TicketRequest(BaseModel):
+    submission_id: UUID
+    title: str = Field(min_length=1, max_length=200)
+    filename: str = Field(min_length=1, max_length=255)
+    priority: str = Field(pattern="^(High|Medium|Low)$")
+    note: str = Field(min_length=1, max_length=5000)
+
+
+class TicketStatusUpdate(BaseModel):
+    status: str = Field(pattern="^(Open|Resolved)$")
+
+
 class Violation(BaseModel):
     severity: str
     title: str
@@ -150,6 +164,88 @@ RESULT_SCHEMA = {
     ],
     "additionalProperties": False,
 }
+
+_supabase_client: Client | None = None
+
+
+def get_supabase() -> Client:
+    global _supabase_client
+    if _supabase_client is not None:
+        return _supabase_client
+
+    url = os.getenv("SUPABASE_URL")
+    key = os.getenv("SUPABASE_KEY")
+    if not url or not key:
+        raise HTTPException(
+            status_code=503,
+            detail="Supabase is not configured. Add SUPABASE_URL and SUPABASE_KEY to backend/.env and restart the backend.",
+        )
+    try:
+        _supabase_client = create_client(url, key)
+    except Exception as error:
+        logger.exception("Could not initialize Supabase")
+        raise HTTPException(status_code=503, detail="Could not initialize Supabase. Check backend/.env.") from error
+    return _supabase_client
+
+
+def fetch_rules() -> list[BrandRule]:
+    try:
+        client = get_supabase()
+        rows = client.table("brand_rules").select("category,title,description").order("created_at").execute().data
+        if not rows:
+            rows = client.table("brand_rules").insert(
+                [rule.model_dump() for rule in DEFAULT_RULES]
+            ).execute().data
+        return [BrandRule.model_validate(row) for row in rows]
+    except HTTPException:
+        raise
+    except Exception as error:
+        logger.exception("Could not load brand rules from Supabase")
+        raise HTTPException(status_code=503, detail="Could not load the Supabase rulebook. Check the database schema and credentials.") from error
+
+
+def persist_submission(
+    result: AnalysisResult,
+    filename: str,
+    employee_name: str,
+    content_type: str,
+    content_text: str,
+    rules: list[BrandRule],
+) -> str:
+    payload = {
+        "filename": filename,
+        "content_type": content_type,
+        "employee_name": employee_name,
+        "content_text": content_text,
+        "rules_snapshot": [rule.model_dump() for rule in rules],
+        "compliance_score": result.compliance_score,
+        "publishing_status": result.publishing_status,
+        "violations": [violation.model_dump() for violation in result.violations],
+        "recommendations": result.recommendations,
+    }
+    try:
+        rows = get_supabase().table("submissions").insert(payload).execute().data
+        return rows[0]["id"]
+    except HTTPException:
+        raise
+    except Exception as error:
+        logger.exception("Could not save submission to Supabase")
+        raise HTTPException(status_code=503, detail="Analysis completed, but the submission could not be saved to Supabase.") from error
+
+
+def save_analysis(
+    result: AnalysisResult,
+    filename: str,
+    employee_name: str,
+    content_type: str,
+    content_text: str,
+    rules: list[BrandRule],
+) -> dict:
+    response = response_payload(result, filename, employee_name)
+    response["submission_id"] = persist_submission(
+        result, filename, employee_name, content_type, content_text, rules
+    )
+    return response
 
 
 def require_openai_client() -> OpenAI:
@@ -409,15 +505,121 @@ def home():
     return {"message": "Brand Lens API is running", "status": "online"}
 
 
+@app.get("/api/rules")
+def list_rules():
+    fetch_rules()
+    try:
+        return get_supabase().table("brand_rules").select("*").order("created_at").execute().data
+    except Exception as error:
+        logger.exception("Could not list brand rules")
+        raise HTTPException(status_code=503, detail="Could not load brand rules.") from error
+
+
+@app.post("/api/rules")
+def create_rule(rule: BrandRule):
+    try:
+        rows = get_supabase().table("brand_rules").insert(rule.model_dump()).execute().data
+        return rows[0]
+    except Exception as error:
+        logger.exception("Could not create brand rule")
+        raise HTTPException(status_code=503, detail="Could not save the brand rule.") from error
+
+
+@app.put("/api/rules/{rule_id}")
+def update_rule(rule_id: UUID, rule: BrandRule):
+    try:
+        rows = get_supabase().table("brand_rules").update(rule.model_dump()).eq("id", str(rule_id)).execute().data
+        if not rows:
+            raise HTTPException(status_code=404, detail="Brand rule not found.")
+        return rows[0]
+    except HTTPException:
+        raise
+    except Exception as error:
+        logger.exception("Could not update brand rule")
+        raise HTTPException(status_code=503, detail="Could not update the brand rule.") from error
+
+
+@app.delete("/api/rules/{rule_id}")
+def delete_rule(rule_id: UUID):
+    try:
+        rows = get_supabase().table("brand_rules").delete().eq("id", str(rule_id)).execute().data
+        if not rows:
+            raise HTTPException(status_code=404, detail="Brand rule not found.")
+        return {"success": True}
+    except HTTPException:
+        raise
+    except Exception as error:
+        logger.exception("Could not delete brand rule")
+        raise HTTPException(status_code=503, detail="Could not delete the brand rule.") from error
+
+
+@app.get("/api/submissions")
+def list_submissions():
+    try:
+        return get_supabase().table("submissions").select("*").order("created_at", desc=True).execute().data
+    except Exception as error:
+        logger.exception("Could not list submissions")
+        raise HTTPException(status_code=503, detail="Could not load submission history.") from error
+
+
+@app.get("/api/submissions/{submission_id}")
+def get_submission(submission_id: UUID):
+    try:
+        rows = get_supabase().table("submissions").select("*").eq("id", str(submission_id)).limit(1).execute().data
+        if not rows:
+            raise HTTPException(status_code=404, detail="Submission not found.")
+        return rows[0]
+    except HTTPException:
+        raise
+    except Exception as error:
+        logger.exception("Could not load submission")
+        raise HTTPException(status_code=503, detail="Could not load the submission.") from error
+
+
+@app.get("/api/tickets")
+def list_tickets():
+    try:
+        return get_supabase().table("tickets").select("*").order("created_at", desc=True).execute().data
+    except Exception as error:
+        logger.exception("Could not list tickets")
+        raise HTTPException(status_code=503, detail="Could not load tickets.") from error
+
+
+@app.post("/api/tickets")
+def create_ticket(ticket: TicketRequest):
+    payload = ticket.model_dump(mode="json")
+    try:
+        rows = get_supabase().table("tickets").insert(payload).execute().data
+        return rows[0]
+    except Exception as error:
+        logger.exception("Could not create ticket")
+        raise HTTPException(status_code=503, detail="Could not save the ticket.") from error
+
+
+@app.patch("/api/tickets/{ticket_id}")
+def update_ticket(ticket_id: UUID, update: TicketStatusUpdate):
+    try:
+        rows = get_supabase().table("tickets").update(update.model_dump()).eq("id", str(ticket_id)).execute().data
+        if not rows:
+            raise HTTPException(status_code=404, detail="Ticket not found.")
+        return rows[0]
+    except HTTPException:
+        raise
+    except Exception as error:
+        logger.exception("Could not update ticket")
+        raise HTTPException(status_code=503, detail="Could not update the ticket.") from error
+
+
 @app.post("/api/analyze")
 def analyze_content(data: AnalysisRequest):
     client = require_openai_client()
+    rules = fetch_rules()
     result = analyze_submission(
         client,
         data.content,
-        selected_rules(data.rules),
+        rules,
     )
-    return response_payload(result, data.filename, data.employee_name)
+    return save_analysis(result, data.filename, data.employee_name, "text", data.content, rules)
 
 
 @app.post("/api/analyze/image")
@@ -456,13 +658,14 @@ def analyze_image(
         if ocr_text
         else f"Employee-provided context:\n{context}\n\nOCR did not extract text; inspect the image directly."
     )
+    rules = fetch_rules()
     result = analyze_submission(
         client,
         analysis_text,
-        selected_rules(normalize_rules(rules_json)),
+        rules,
         images=[data],
     )
-    return response_payload(result, file.filename or "Uploaded image", employee_name)
+    return save_analysis(result, file.filename or "Uploaded image", employee_name, "image", analysis_text, rules)
 
 
 @app.post("/api/analyze/video")
@@ -498,10 +701,11 @@ def analyze_video(
         f"Employee-provided context:\n{context}\n\n"
         f"Audio transcript:\n{transcript or '[No audio track or transcription available.]'}"
     )
+    rules = fetch_rules()
     result = analyze_submission(
         client,
         analysis_text,
-        selected_rules(normalize_rules(rules_json)),
+        rules,
         images=frames,
     )
-    return response_payload(result, file.filename or "Uploaded video", employee_name)
+    return save_analysis(result, file.filename or "Uploaded video", employee_name, "video", analysis_text, rules)

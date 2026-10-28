@@ -6,3 +6,4 @@ openai
 Pillow
 pytesseract
 imageio-ffmpeg
+supabase
