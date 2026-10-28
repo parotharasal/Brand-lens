@@ -65,7 +65,8 @@ alter table public.submissions
     add column if not exists compliance_score integer,
     add column if not exists publishing_status text not null default 'Needs human review',
     add column if not exists violations jsonb not null default '[]'::jsonb,
-    add column if not exists recommendations jsonb not null default '[]'::jsonb;
+    add column if not exists recommendations jsonb not null default '[]'::jsonb,
+    add column if not exists analysis_response jsonb;
 
 update public.submissions
 set content_text = coalesce(content_text, content, ''),

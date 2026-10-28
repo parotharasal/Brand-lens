@@ -7,6 +7,7 @@ import subprocess
 import tempfile
 from io import BytesIO
 from pathlib import Path
+from typing import Literal
 from uuid import UUID
 
 from dotenv import load_dotenv
@@ -85,6 +86,7 @@ DEFAULT_RULES = [
 
 class AnalysisRequest(BaseModel):
     content: str = Field(min_length=1, max_length=40000)
+    content_type: Literal["text"] = "text"
     employee_name: str = "Employee"
     filename: str = "Written content"
     rules: list[BrandRule] | None = None
@@ -235,6 +237,37 @@ def persist_submission(
     except Exception as error:
         logger.exception("Could not save submission to Supabase")
         raise HTTPException(status_code=503, detail="Analysis completed, but the submission could not be saved to Supabase.") from error
+
+
+def persist_pending_submission(data: AnalysisRequest) -> dict:
+    payload = {
+        "filename": data.filename,
+        "content_type": "text",
+        "employee_name": data.employee_name.strip() or "Employee",
+        "content_text": data.content,
+        "rules_snapshot": [],
+        "analysis_status": "pending",
+        "publishing_status": "Needs human review",
+        "violations": [],
+        "recommendations": [],
+    }
+    try:
+        rows = get_supabase().table("submissions").insert(payload).execute().data
+        if not rows:
+            raise RuntimeError("Supabase did not return the saved text submission.")
+        return rows[0]
+    except HTTPException:
+        raise
+    except Exception as error:
+        logger.exception("Could not save text submission to Supabase")
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Supabase rolled back the submission insert. Disable the database webhook "
+                "on public.submissions that calls n8n (Supabase Dashboard > Database > Webhooks); "
+                "written submissions are saved directly to this table."
+            ),
+        ) from error
 
 
 def save_analysis(
@@ -692,41 +725,26 @@ def update_ticket(ticket_id: UUID, update: TicketStatusUpdate):
         raise HTTPException(status_code=503, detail="Could not update the ticket.") from error
 
 
-@app.post("/api/analyze")
-def analyze_content(data: AnalysisRequest):
-    rules = fetch_rules()
-    payload = {
-        "filename": data.filename,
-        "content_type": "text",
-        "employee_name": data.employee_name,
-        "content_text": data.content,
-        "rules_snapshot": [rule.model_dump() for rule in rules],
-        "analysis_status": "pending",
-        "publishing_status": "Analysis pending",
+@app.post("/api/submissions")
+def create_text_submission(data: AnalysisRequest):
+    if not data.content.strip():
+        raise HTTPException(status_code=422, detail="Enter written content before submitting.")
+
+    saved = persist_pending_submission(data)
+    return {
+        "success": True,
+        "status": "Awaiting review",
+        "publishing_status": saved["publishing_status"],
+        "analysis_status": saved["analysis_status"],
         "compliance_score": None,
-        "violations": [],
-        "recommendations": [],
+        "ai_feedback": "Your written content has been saved to Supabase for review.",
+        "violations": saved["violations"],
+        "suggested_corrections": saved["recommendations"],
+        "submission_id": saved["id"],
+        "history_saved": True,
+        "direct_analysis": True,
+        "file": saved["filename"],
     }
-    try:
-        rows = get_supabase().table("submissions").insert(payload).execute().data
-        if not rows:
-            raise RuntimeError("Supabase did not return the inserted submission.")
-        row = rows[0]
-        return {
-            "success": True,
-            "submission_id": row["id"],
-            "analysis_status": row["analysis_status"],
-            "file": row["filename"],
-            "employee": row["employee_name"],
-        }
-    except HTTPException:
-        raise
-    except Exception as error:
-        logger.exception("Could not queue text submission for n8n analysis")
-        raise HTTPException(
-            status_code=503,
-            detail="Could not queue the text submission in Supabase.",
-        ) from error
 
 
 @app.post("/api/analyze/image")

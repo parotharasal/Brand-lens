@@ -19,6 +19,7 @@ create table if not exists public.submissions (
     publishing_status text not null,
     violations jsonb not null default '[]'::jsonb,
     recommendations jsonb not null default '[]'::jsonb,
+    analysis_response jsonb,
     created_at timestamptz not null default now()
 );
 
