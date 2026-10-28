@@ -13,7 +13,7 @@ create table if not exists public.submissions (
     employee_name text not null,
     content_text text not null,
     rules_snapshot jsonb not null,
-    analysis_status text not null default 'completed'
+    analysis_status text not null default 'pending'
         check (analysis_status in ('pending', 'processing', 'completed', 'failed')),
     compliance_score integer check (compliance_score between 0 and 100),
     publishing_status text not null,
