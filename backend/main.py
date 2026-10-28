@@ -1,4 +1,5 @@
 import base64
+import asyncio
 import json
 import logging
 import os
@@ -11,13 +12,15 @@ from uuid import UUID
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from imageio_ffmpeg import get_ffmpeg_exe
 from openai import APIConnectionError, APIError, OpenAI, RateLimitError
 from PIL import Image as PILImage, UnidentifiedImageError
 from pydantic import BaseModel, Field, ValidationError
 import pytesseract
 from pytesseract import TesseractNotFoundError
-from supabase import Client, create_client
+from realtime.types import RealtimePostgresChangesListenEvent, RealtimeSubscribeStates
+from supabase import Client, create_async_client, create_client
 
 
 load_dotenv(Path(__file__).with_name(".env"))
@@ -218,6 +221,7 @@ def persist_submission(
         "employee_name": employee_name,
         "content_text": content_text,
         "rules_snapshot": [rule.model_dump() for rule in rules],
+        "analysis_status": "completed",
         "compliance_score": result.compliance_score,
         "publishing_status": result.publishing_status,
         "violations": [violation.model_dump() for violation in result.violations],
@@ -505,6 +509,84 @@ def home():
     return {"message": "Brand Lens API is running", "status": "online"}
 
 
+@app.get("/api/events")
+async def stream_database_events():
+    url = os.getenv("SUPABASE_URL")
+    key = os.getenv("SUPABASE_KEY")
+    if not url or not key:
+        raise HTTPException(
+            status_code=503,
+            detail="Supabase is not configured. Add SUPABASE_URL and SUPABASE_KEY to backend/.env and restart the backend.",
+        )
+
+    try:
+        client = await create_async_client(url, key)
+        channel = client.channel("brand-lens-company-portal")
+        loop = asyncio.get_running_loop()
+        queue: asyncio.Queue[str] = asyncio.Queue()
+        ready = loop.create_future()
+
+        def subscription_status(status, error):
+            if ready.done():
+                return
+            if status == RealtimeSubscribeStates.SUBSCRIBED:
+                ready.set_result(None)
+            elif status in {
+                RealtimeSubscribeStates.TIMED_OUT,
+                RealtimeSubscribeStates.CHANNEL_ERROR,
+                RealtimeSubscribeStates.CLOSED,
+            }:
+                ready.set_exception(error or RuntimeError(f"Supabase Realtime subscription {status.value}."))
+
+        for table in ("brand_rules", "submissions", "tickets"):
+            def on_change(_payload, changed_table=table):
+                loop.call_soon_threadsafe(queue.put_nowait, changed_table)
+
+            channel.on_postgres_changes(
+                RealtimePostgresChangesListenEvent.All,
+                on_change,
+                schema="public",
+                table=table,
+            )
+
+        await channel.subscribe(subscription_status)
+        await asyncio.wait_for(ready, timeout=15)
+    except Exception as error:
+        if "client" in locals():
+            try:
+                await client.realtime.close()
+            except Exception:
+                logger.exception("Could not close the failed Supabase Realtime connection")
+        logger.exception("Could not subscribe to Supabase Realtime")
+        raise HTTPException(
+            status_code=503,
+            detail="Could not connect to Supabase Realtime. Run the realtime setup SQL and check the Supabase connection.",
+        ) from error
+
+    async def events():
+        try:
+            yield "event: connected\ndata: {}\n\n"
+            while True:
+                try:
+                    table = await asyncio.wait_for(queue.get(), timeout=20)
+                except asyncio.TimeoutError:
+                    yield ": keep-alive\n\n"
+                else:
+                    yield f"event: change\ndata: {json.dumps({'table': table})}\n\n"
+        finally:
+            await client.remove_channel(channel)
+            await client.realtime.close()
+
+    return StreamingResponse(
+        events(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 @app.get("/api/rules")
 def list_rules():
     fetch_rules()
@@ -612,14 +694,39 @@ def update_ticket(ticket_id: UUID, update: TicketStatusUpdate):
 
 @app.post("/api/analyze")
 def analyze_content(data: AnalysisRequest):
-    client = require_openai_client()
     rules = fetch_rules()
-    result = analyze_submission(
-        client,
-        data.content,
-        rules,
-    )
-    return save_analysis(result, data.filename, data.employee_name, "text", data.content, rules)
+    payload = {
+        "filename": data.filename,
+        "content_type": "text",
+        "employee_name": data.employee_name,
+        "content_text": data.content,
+        "rules_snapshot": [rule.model_dump() for rule in rules],
+        "analysis_status": "pending",
+        "publishing_status": "Analysis pending",
+        "compliance_score": None,
+        "violations": [],
+        "recommendations": [],
+    }
+    try:
+        rows = get_supabase().table("submissions").insert(payload).execute().data
+        if not rows:
+            raise RuntimeError("Supabase did not return the inserted submission.")
+        row = rows[0]
+        return {
+            "success": True,
+            "submission_id": row["id"],
+            "analysis_status": row["analysis_status"],
+            "file": row["filename"],
+            "employee": row["employee_name"],
+        }
+    except HTTPException:
+        raise
+    except Exception as error:
+        logger.exception("Could not queue text submission for n8n analysis")
+        raise HTTPException(
+            status_code=503,
+            detail="Could not queue the text submission in Supabase.",
+        ) from error
 
 
 @app.post("/api/analyze/image")

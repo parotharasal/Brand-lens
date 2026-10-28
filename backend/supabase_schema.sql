@@ -13,6 +13,8 @@ create table if not exists public.submissions (
     employee_name text not null,
     content_text text not null,
     rules_snapshot jsonb not null,
+    analysis_status text not null default 'completed'
+        check (analysis_status in ('pending', 'processing', 'completed', 'failed')),
     compliance_score integer check (compliance_score between 0 and 100),
     publishing_status text not null,
     violations jsonb not null default '[]'::jsonb,
@@ -40,3 +42,24 @@ create index if not exists tickets_created_at_idx
 alter table public.brand_rules enable row level security;
 alter table public.submissions enable row level security;
 alter table public.tickets enable row level security;
+
+do $$
+declare
+    table_name text;
+begin
+    if exists (select 1 from pg_publication where pubname = 'supabase_realtime') then
+        foreach table_name in array array['brand_rules', 'submissions', 'tickets']
+        loop
+            if not exists (
+                select 1
+                from pg_publication_tables
+                where pubname = 'supabase_realtime'
+                  and schemaname = 'public'
+                  and tablename = table_name
+            ) then
+                execute format('alter publication supabase_realtime add table public.%I', table_name);
+            end if;
+        end loop;
+    end if;
+end;
+$$;

@@ -61,6 +61,7 @@ alter table public.submissions
     add column if not exists employee_name text not null default 'Employee',
     add column if not exists content_text text,
     add column if not exists rules_snapshot jsonb not null default '[]'::jsonb,
+    add column if not exists analysis_status text not null default 'completed',
     add column if not exists compliance_score integer,
     add column if not exists publishing_status text not null default 'Needs human review',
     add column if not exists violations jsonb not null default '[]'::jsonb,
@@ -135,6 +136,27 @@ drop trigger if exists sync_brand_lens_ticket_message on public.tickets;
 create trigger sync_brand_lens_ticket_message
 before insert or update on public.tickets
 for each row execute function public.sync_brand_lens_ticket_message();
+
+do $$
+declare
+    table_name text;
+begin
+    if exists (select 1 from pg_publication where pubname = 'supabase_realtime') then
+        foreach table_name in array array['brand_rules', 'submissions', 'tickets']
+        loop
+            if not exists (
+                select 1
+                from pg_publication_tables
+                where pubname = 'supabase_realtime'
+                  and schemaname = 'public'
+                  and tablename = table_name
+            ) then
+                execute format('alter publication supabase_realtime add table public.%I', table_name);
+            end if;
+        end loop;
+    end if;
+end;
+$$;
 
 notify pgrst, 'reload schema';
 
